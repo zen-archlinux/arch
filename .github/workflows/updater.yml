@@ -1,0 +1,95 @@
+name: Update Repo
+
+on:
+  schedule:
+    - cron: '0 5 * * *'
+  workflow_dispatch:
+
+jobs:
+  zen-browser:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux/archlinux:latest
+
+    steps:
+    - name: Update System
+      run: |
+        pacman-key --init
+        pacman-key --populate archlinux
+        pacman -Sy base-devel git sudo pacman-contrib jq --noconfirm
+        pacman -Syu --noconfirm
+        yes | pacman -Scc
+
+    - name: Add a user
+      run: |
+        useradd -m builder
+        echo "builder ALL=(ALL) NOPASSWD: ALL" | tee -a /etc/sudoers
+
+    - name: Clone
+      run: |
+        [ -d "/home/builder" ] && cd /home/builder || { mkdir -p /home/builder && cd /home/builder; }
+        chmod 777 /home/builder && chown builder:builder /home/builder
+        git config --global --add safe.directory '*'
+        su builder -c 'git clone https://github.com/archlinux/aur.git -b zen-browser-bin --single-branch /home/builder/zen-browser-bin'
+        su builder -c 'git clone https://github.com/zen-archlinux/zen-browser-twilight /home/builder/zen-browser-twilight'
+        su builder -c 'git clone https://github.com/zen-archlinux/arch /home/builder/arch -b x86_64'
+
+    - name: Update Checks
+      run: |
+        LATEST_COMMIT_IN_STABLE=$(git -C /home/builder/zen-browser-bin rev-parse HEAD)
+        SAVED_COMMIT_IN_STABLE=$(cat /home/builder/arch/info/stable)
+        if [ "$LATEST_COMMIT_IN_STABLE" = "$SAVED_COMMIT_IN_STABLE" ]; then
+            echo "skip_stable_update=true" >> $GITHUB_ENV
+        else
+            echo "skip_stable_update=false" >> $GITHUB_ENV
+        fi
+
+        LATEST_TWILIGHT_RELEASE_NAME=$(curl -s https://api.github.com/repos/zen-browser/desktop/releases/tags/twilight-1 | jq -r '.name')
+        SAVED_TWILIGHT_RELEASE_NAME=$(cat /home/builder/arch/info/twilight)
+        if [ "$LATEST_TWILIGHT_RELEASE_NAME" = "$SAVED_TWILIGHT_RELEASE_NAME" ]; then
+            echo "skip_twilight_update=true" >> $GITHUB_ENV
+        else
+            echo "skip_twilight_update=false" >> $GITHUB_ENV
+        fi
+        sed -i '/^OPTIONS=/ s/\<debug\>/!debug/g' /etc/makepkg.conf
+        sed -i 's/^COMPRESSZST=.*/COMPRESSZST=(zstd -c -T0 --ultra -22 -)/' /etc/makepkg.conf
+
+    - name: Zen Stable
+      if: env.skip_stable_update == 'false'
+      run: |
+        cd /home/builder/zen-browser-bin
+        su builder -c 'makepkg --syncdeps --noconfirm --needed'
+        echo "ZEN_STABLE_UPDATED=true" >> $GITHUB_ENV
+        STABLE_VER=$(grep 'pkgver=' PKGBUILD | cut -d'=' -f2)-$(grep 'pkgrel=' PKGBUILD | cut -d'=' -f2)
+        echo "STABLE_VER=${STABLE_VER}" >> $GITHUB_ENV
+
+    - name: Zen Twilight
+      if: env.skip_twilight_update == 'false'
+      run: |
+        cd /home/builder/zen-browser-twilight
+        su builder -c 'makepkg --syncdeps --noconfirm --needed'
+        echo "ZEN_TWILIGHT_UPDATED=true" >> $GITHUB_ENV
+        TWILIGHT_VER=$(grep 'pkgver=' PKGBUILD | cut -d'=' -f2)-$(grep 'pkgrel=' PKGBUILD | cut -d'=' -f2)
+        echo "TWILIGHT_VER=${TWILIGHT_VER}" >> $GITHUB_ENV
+
+    - name: Push
+      if: env.ZEN_STABLE_UPDATED == 'true' || env.ZEN_TWILIGHT_UPDATED == 'true'
+      run: |
+        git config --global user.email "omansh@duck.com" && git config --global user.name "Omansh Krishn"
+        cd /home/builder/arch
+        if [ ${{ env.ZEN_STABLE_UPDATED }} == "true" ]; then
+            rm zen-browser-bin*zst
+            cp /home/builder/zen-browser-bin/*zst .
+            repo-add zen-browser.db.tar.gz *zst
+            git -C /home/builder/zen-browser-bin rev-parse HEAD > info/stable
+            git add . && git commit -s -m 'zen-browser: ${{ env.STABLE_VER }}'
+        fi
+        if [ ${{ env.ZEN_TWILIGHT_UPDATED }} == "true" ]; then
+            rm zen-browser-twilight-bin*zst
+            cp /home/builder/zen-browser-twilight/*zst .
+            repo-add zen-browser.db.tar.gz *zst
+            curl -s https://api.github.com/repos/zen-browser/desktop/releases/tags/twilight-1 | jq -r '.name' > info/twilight
+            git add . && git commit -s -m 'zen-browser-twilight: ${{ env.TWILIGHT_VER }}'
+        fi
+
+        git push "https://omansh-krishn:${{ secrets.PAT }}@github.com/zen-archlinux/arch.git" x86_64
